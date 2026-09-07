@@ -1,8 +1,8 @@
-﻿# vpn-probe
+# vpn-probe
 
 > Red team security tool — authorized use only.
 
-`ash
+```bash
 python vpn_probe.py --help
 ```
 
