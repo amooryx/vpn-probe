@@ -1,144 +1,287 @@
 #!/usr/bin/env python3
-"""
-VPN Probe — VPN Endpoint Discovery & Fingerprinting Tool
-Identifies VPN technology (OpenVPN, IKEv1/v2, Cisco, Fortinet) and checks for default configs.
-Author: Omar Khalid (amooryx) | github.com/amooryx/vpn-probe
-AUTHORIZED USE ONLY.
-"""
+"""Bounded, non-authenticating VPN endpoint inventory and fingerprinting."""
 
 import argparse
+import ipaddress
 import json
+import math
+import re
 import socket
-import struct
-import sys
-import urllib.request
-import urllib.error
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VPN_PORTS = {
-    1194: ("OpenVPN", "UDP/TCP"),
-    500:  ("IKE/IPSec", "UDP"),
-    4500: ("NAT-T IPSec", "UDP"),
-    1723: ("PPTP", "TCP"),
-    1701: ("L2TP", "UDP"),
-    443:  ("SSL VPN (Cisco/Fortinet/Pulse)", "TCP"),
-    8443: ("SSL VPN Alt", "TCP"),
-    10443:("Pulse Secure", "TCP"),
-}
+TCP_PORTS = (1194, 1723, 443, 8443, 10443)
+UDP_PORTS = (1194, 500, 4500, 1701)
+HTTPS_PORTS = (443, 8443, 10443)
+MAX_HOSTS = 64
+MAX_THREADS = 16
+MAX_TIMEOUT = 30.0
+MAX_BODY_BYTES = 2048
+MIN_REQUESTS_PER_SECOND = 0.1
+MAX_REQUESTS_PER_SECOND = 5.0
+DEFAULT_REQUESTS_PER_SECOND = 2.0
+HOST_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 
-SSL_VPN_PATHS = {
-    "cisco_anyconnect": ["/+CSCOE+/logon.html", "/+CSCOE+/portal.html"],
-    "fortinet": ["/remote/login", "/remote/logincheck", "/remote/info"],
-    "pulse_secure": ["/dana-na/auth/url_default/welcome.cgi"],
-    "palo_alto": ["/global-protect/login.esp", "/global-protect/getconfig.esp"],
-    "f5_big_ip": ["/my.policy", "/vdesk/hangup.php3"],
-    "openvpn_web": ["/vpninfo/users/0"],
-}
+VPN_PAGE_SIGNATURES = (
+    {
+        "vendor": "cisco_anyconnect",
+        "path": "/+CSCOE+/logon.html",
+        "markers": ("webvpn", "cscoe", "cisco secure"),
+    },
+    {
+        "vendor": "fortinet",
+        "path": "/remote/login",
+        "markers": ("fortinet", "fortigate"),
+    },
+    {
+        "vendor": "pulse_secure",
+        "path": "/dana-na/auth/url_default/welcome.cgi",
+        "markers": ("pulse secure",),
+    },
+    {
+        "vendor": "palo_alto_globalprotect",
+        "path": "/global-protect/login.esp",
+        "markers": ("globalprotect", "global protect", "palo alto networks"),
+    },
+    {
+        "vendor": "f5_big_ip",
+        "path": "/my.policy",
+        "markers": ("big-ip", "bigip", "f5 networks"),
+    },
+)
 
-def tcp_connect(host: str, port: int, timeout: float = 5) -> bool:
+
+def validate_host(host: str) -> str:
+    """Accept a plain IPv4 address or DNS hostname, never a URL or port."""
+    if not host or host != host.strip() or any(char in host for char in "/\\:@[]?#"):
+        raise ValueError(f"invalid target host: {host!r}")
     try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except Exception:
-        return False
+        return str(ipaddress.IPv4Address(host))
+    except ipaddress.AddressValueError:
+        try:
+            hostname = host.rstrip(".").encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError(f"invalid target host: {host!r}") from exc
+        if len(hostname) > 253 or not all(HOST_LABEL.fullmatch(label) for label in hostname.split(".")):
+            raise ValueError(f"invalid target host: {host!r}")
+        return hostname.lower()
 
-def udp_probe(host: str, port: int, payload: bytes, timeout: float = 3) -> bytes:
+
+def validate_positive_number(value: str, name: str, maximum: float) -> float:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(payload, (host, port))
-        data = s.recv(512)
-        s.close()
-        return data
-    except Exception:
-        return b""
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{name} must be a number") from exc
+    if not math.isfinite(number) or number <= 0 or number > maximum:
+        raise argparse.ArgumentTypeError(f"{name} must be greater than 0 and at most {maximum:g}")
+    return number
 
-def ike_v1_probe(host: str, port: int = 500) -> dict:
-    """Send IKEv1 main mode initiate and check for IKE response."""
-    # IKEv1 SA_INIT: simplified probe (no crypto negotiation)
-    cookie_i = b"\x01\x02\x03\x04\x05\x06\x07\x08"
-    cookie_r = b"\x00" * 8
-    header   = cookie_i + cookie_r + b"\x01\x10\x02\x00\x00\x00\x00\x00\x00\x00\x00\x1c"
-    resp     = udp_probe(host, port, header)
-    if len(resp) >= 28:
-        return {"protocol": "IKEv1", "response_bytes": len(resp), "open": True}
-    return {"protocol": "IKEv1", "open": False}
 
-def check_ssl_vpn(host: str, port: int) -> list[dict]:
-    """Check for known SSL VPN login pages."""
-    findings = []
-    base_url = f"https://{host}:{port}"
-    for vendor, paths in SSL_VPN_PATHS.items():
-        for path in paths:
-            url = base_url + path
-            try:
-                import ssl
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode    = ssl.CERT_NONE
-                req = urllib.request.Request(url)
-                with urllib.request.urlopen(req, context=ctx, timeout=8) as resp:
-                    body = resp.read(2048).decode(errors="ignore").lower()
-                    if any(kw in body for kw in ["login", "password", "vpn", "connect", "sign in"]):
-                        findings.append({
-                            "vendor": vendor, "url": url, "status": resp.status,
-                            "note": f"SSL VPN login page detected: {vendor}",
-                        })
-                        print(f"  [!!!] {vendor.upper()} VPN login found: {url}")
-                        break
-            except urllib.error.HTTPError as e:
-                if e.code in (200, 302):
-                    findings.append({"vendor": vendor, "url": url, "status": e.code})
-            except Exception:
-                pass
-    return findings
+class RequestRateLimiter:
+    """Apply one aggregate minimum interval between network probes."""
 
-def scan_host(host: str, timeout: float) -> dict:
-    result = {"host": host, "vpn_ports": {}, "ssl_vpn": [], "ike": {}}
+    def __init__(self, requests_per_second: float):
+        self._interval = 1.0 / requests_per_second
+        self._lock = threading.Lock()
+        self._next_request = 0.0
 
-    for port, (service, proto) in VPN_PORTS.items():
-        if "TCP" in proto:
-            open_ = tcp_connect(host, port, timeout)
-        else:
-            # Try UDP by sending minimal payload
-            resp = udp_probe(host, port, b"\x00" * 4, timeout=2)
-            open_ = len(resp) > 0
-        if open_:
-            result["vpn_ports"][port] = {"service": service, "proto": proto}
-            print(f"  [+] {host}:{port} {service} ({proto})")
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = self._next_request - now
+            if delay > 0:
+                time.sleep(delay)
+            self._next_request = time.monotonic() + self._interval
 
-    if result["vpn_ports"].get(500):
-        result["ike"] = ike_v1_probe(host, 500)
 
-    for port in [443, 8443, 10443]:
-        if result["vpn_ports"].get(port):
-            result["ssl_vpn"].extend(check_ssl_vpn(host, port))
+def tcp_probe(host: str, port: int, timeout: float) -> dict:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return {"state": "reachable", "evidence": "TCP connection accepted"}
+    except ConnectionRefusedError:
+        return {"state": "closed"}
+    except (socket.timeout, TimeoutError):
+        return {"state": "no_response", "error": "connection timed out"}
+    except OSError as exc:
+        return {"state": "error", "error": str(exc)}
+
+
+def udp_probe(host: str, port: int, timeout: float) -> dict:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(b"\x00" * 4, (host, port))
+            data, _ = sock.recvfrom(512)
+        return {
+            "state": "response_received",
+            "response_bytes": len(data),
+            "evidence": "UDP response received; service and protocol are unconfirmed",
+        }
+    except (socket.timeout, TimeoutError):
+        return {"state": "no_response"}
+    except OSError as exc:
+        return {"state": "error", "error": str(exc)}
+
+
+class SameOriginRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, host: str, port: int, limiter: RequestRateLimiter):
+        super().__init__()
+        self.host = host.lower()
+        self.port = port
+        self.limiter = limiter
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination = urlsplit(newurl)
+        destination_port = destination.port or (443 if destination.scheme == "https" else 80)
+        if (
+            destination.scheme != "https"
+            or (destination.hostname or "").lower() != self.host
+            or destination_port != self.port
+        ):
+            raise URLError("redirect outside the requested HTTPS origin was blocked")
+        self.limiter.wait()
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def target_netloc(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def check_https_pages(
+    host: str, port: int, timeout: float, limiter: RequestRateLimiter
+) -> tuple[list, list, list]:
+    fingerprints = []
+    observations = []
+    errors = []
+    opener = build_opener(SameOriginRedirectHandler(host, port, limiter))
+
+    for signature in VPN_PAGE_SIGNATURES:
+        url = f"https://{target_netloc(host, port)}{signature['path']}"
+        limiter.wait()
+        request = Request(url, headers={"User-Agent": "vpn-probe/1.0"})
+        try:
+            response = opener.open(request, timeout=timeout)
+        except HTTPError as exc:
+            response = exc
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            errors.append({"probe": signature["vendor"], "error": str(exc)})
+            continue
+
+        try:
+            status = response.code
+            observations.append({"probe": signature["vendor"], "path": signature["path"], "status": status})
+            if status >= 500:
+                errors.append({"probe": signature["vendor"], "error": f"HTTP status {status}"})
+            body = response.read(MAX_BODY_BYTES).decode("utf-8", errors="replace").lower()
+        except (OSError, URLError, TimeoutError) as exc:
+            errors.append({"probe": signature["vendor"], "error": str(exc)})
+            continue
+        finally:
+            response.close()
+
+        marker = next((item for item in signature["markers"] if item in body), None)
+        if marker:
+            fingerprints.append({
+                "vendor": signature["vendor"],
+                "url": url,
+                "status": status,
+                "evidence": f"vendor-specific page marker: {marker}",
+            })
+
+    return fingerprints, observations, errors
+
+
+def scan_host(host: str, timeout: float, limiter: RequestRateLimiter) -> dict:
+    result = {
+        "host": host,
+        "ports": {},
+        "https_observations": [],
+        "fingerprints": [],
+        "errors": [],
+        "limitations": "Port reachability and UDP responses do not identify a VPN service or protocol.",
+    }
+
+    for port in TCP_PORTS:
+        limiter.wait()
+        observation = tcp_probe(host, port, timeout)
+        result["ports"][f"tcp/{port}"] = observation
+        if observation.get("state") == "error":
+            result["errors"].append({"probe": f"tcp/{port}", "error": observation["error"]})
+
+    for port in UDP_PORTS:
+        limiter.wait()
+        observation = udp_probe(host, port, timeout)
+        result["ports"][f"udp/{port}"] = observation
+        if observation.get("state") == "error":
+            result["errors"].append({"probe": f"udp/{port}", "error": observation["error"]})
+
+    for port in HTTPS_PORTS:
+        if result["ports"][f"tcp/{port}"]["state"] != "reachable":
+            continue
+        matches, observations, errors = check_https_pages(host, port, timeout, limiter)
+        result["fingerprints"].extend(matches)
+        result["https_observations"].extend(
+            {"port": port, **observation} for observation in observations
+        )
+        result["errors"].extend(
+            {"probe": f"https/{port}/{error['probe']}", "error": error["error"]}
+            for error in errors
+        )
 
     return result
 
-def main():
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="VPN Probe — VPN Endpoint Fingerprinting (Authorized use only)",
+        description="Bounded, non-authenticating VPN endpoint inventory (authorized targets only)."
     )
-    parser.add_argument("hosts",     nargs="+", help="Target hosts/IPs")
-    parser.add_argument("--threads", type=int, default=10)
-    parser.add_argument("--timeout", type=float, default=5)
-    parser.add_argument("--out",     help="Output JSON file")
-    args = parser.parse_args()
+    parser.add_argument("hosts", nargs="+", help="Plain IPv4 addresses or DNS hostnames")
+    parser.add_argument("--threads", type=int, default=4, help=f"Concurrent hosts (1-{MAX_THREADS}, default: 4)")
+    parser.add_argument(
+        "--timeout",
+        type=lambda value: validate_positive_number(value, "timeout", MAX_TIMEOUT),
+        default=5.0,
+        help=f"Per-probe timeout in seconds (greater than 0, at most {MAX_TIMEOUT:g}; default: 5)",
+    )
+    parser.add_argument(
+        "--rate",
+        type=lambda value: validate_positive_number(value, "rate", MAX_REQUESTS_PER_SECOND),
+        default=DEFAULT_REQUESTS_PER_SECOND,
+        help=f"Aggregate probes per second ({MIN_REQUESTS_PER_SECOND:g}-{MAX_REQUESTS_PER_SECOND:g}, default: 2)",
+    )
+    parser.add_argument("--out", help="Write JSON results to this file (default: stdout)")
+    args = parser.parse_args(argv)
 
-    print(f"[*] VPN probing: {len(args.hosts)} hosts")
-    results = []
-    with ThreadPoolExecutor(max_workers=args.threads) as exe:
-        futures = {exe.submit(scan_host, h, args.timeout): h for h in args.hosts}
-        for fut in futures:
-            r = fut.result()
-            results.append(r)
+    if not 1 <= args.threads <= MAX_THREADS:
+        parser.error(f"--threads must be between 1 and {MAX_THREADS}")
+    try:
+        args.hosts = list(dict.fromkeys(validate_host(host) for host in args.hosts))
+    except ValueError as exc:
+        parser.error(str(exc))
+    if len(args.hosts) > MAX_HOSTS:
+        parser.error(f"at most {MAX_HOSTS} hosts may be scanned at once")
+    if args.rate < MIN_REQUESTS_PER_SECOND:
+        parser.error(f"--rate must be at least {MIN_REQUESTS_PER_SECOND:g}")
+    return args
 
+
+def main(argv=None):
+    args = parse_args(argv)
+    limiter = RequestRateLimiter(args.rate)
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        results = list(executor.map(lambda host: scan_host(host, args.timeout, limiter), args.hosts))
+
+    output = json.dumps(results, indent=2)
     if args.out:
-        with open(args.out, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"[*] Results → {args.out}")
+        with open(args.out, "w", encoding="utf-8") as output_file:
+            output_file.write(output + "\n")
+    else:
+        print(output)
+
 
 if __name__ == "__main__":
     main()
